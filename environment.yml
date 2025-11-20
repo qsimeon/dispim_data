@@ -1,0 +1,22 @@
+name: dispim_visualization
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - jupyter
+  - notebook
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - ipywidgets
+  - pip
+  - pip:
+    - tifffile
+    - aicsimageio
+    - ome-types
+    - imageio
+    - imageio-ffmpeg
+    - opencv-python
+
