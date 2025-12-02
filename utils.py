@@ -645,7 +645,7 @@ def create_camera_overlay(cam1_img, cam2_img, cam1_name='', cam2_name=''):
 
 
 def display_camera_overlays(alpha_data, beta_data, alpha_meta, beta_meta, 
-                            slice_indices=None, num_samples=5, figsize=(20, 10)):
+                            slice_indices=None, num_samples=5, figsize=(10, 2.5)):
     """
     Display camera overlays for multiple slices showing alpha and beta arms side-by-side.
     
@@ -686,7 +686,12 @@ def display_camera_overlays(alpha_data, beta_data, alpha_meta, beta_meta,
         num_samples = len(slice_indices)
     
     # Create figure with subplots: one row per slice, two columns (alpha, beta)
-    fig, axes = plt.subplots(num_samples, 2, figsize=figsize)
+    # Reduce figsize for less whitespace between columns
+    fig, axes = plt.subplots(
+        num_samples, 2, 
+        figsize=figsize, 
+        gridspec_kw={'wspace': 0.02, 'hspace': 0.15, 'width_ratios': [1, 1]}
+    )
     if num_samples == 1:
         axes = axes.reshape(1, -1)
     
@@ -711,19 +716,21 @@ def display_camera_overlays(alpha_data, beta_data, alpha_meta, beta_meta,
         axes[i, 0].axis('off')
         axes[i, 0].set_title(f'Alpha Arm - Slice {slice_idx}\n'
                             f'{alpha_channels[0]} (red) + {alpha_channels[1]} (green)',
-                            fontsize=10)
+                            fontsize=8)
         
         # Display beta overlay (right column)
         axes[i, 1].imshow(beta_overlay, aspect='equal')
         axes[i, 1].axis('off')
         axes[i, 1].set_title(f'Beta Arm - Slice {slice_idx}\n'
                              f'{beta_channels[0]} (red) + {beta_channels[1]} (green)',
-                             fontsize=10)
+                             fontsize=8)
     
     plt.suptitle('Camera Overlays: Red = Camera 0, Green = Camera 1, Yellow = Overlap',
-                 fontsize=14, y=0.995)
-    plt.tight_layout()
-    
+                 fontsize=12, y=0.995)
+    # Use tight_layout with reduced w_pad for compactness; also try constrained_layout for further compactness
+    plt.tight_layout(w_pad=0.01, h_pad=0.4)
+    # (alternatively) fig.subplots_adjust(wspace=0.02, hspace=0.15)
+
     return fig
 
 
