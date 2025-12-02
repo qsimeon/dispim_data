@@ -11,6 +11,10 @@ dependencies:
   - pandas
   - matplotlib
   - ipywidgets
+  - dask
+  - dask-image
+  - scikit-image
+  - napari
   - pip
   - pip:
     - tifffile
@@ -19,4 +23,5 @@ dependencies:
     - imageio
     - imageio-ffmpeg
     - opencv-python
+    - SimpleITK
 
