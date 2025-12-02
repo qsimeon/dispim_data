@@ -94,12 +94,39 @@ def parse_metadata(metadata_path):
         'num_sides': spim_settings.get('numSides', 2),
         'first_side_is_a': spim_settings.get('firstSideIsA', True),
         
+        # SPIM mode and camera settings
+        'spim_mode': spim_settings.get('spimMode', ''),
+        'camera_mode': spim_settings.get('cameraMode', ''),
+        'acquire_both_cameras_simultaneously': spim_settings.get('acquireBothCamerasSimultaneously', False),
+        
+        # Detailed slice timing information
+        'slice_timing': spim_settings.get('sliceTiming', {}),
+        'scan_delay_ms': spim_settings.get('sliceTiming', {}).get('scanDelay', None),
+        'scan_period_ms': spim_settings.get('sliceTiming', {}).get('scanPeriod', None),
+        'laser_delay_ms': spim_settings.get('sliceTiming', {}).get('laserDelay', None),
+        'laser_duration_ms': spim_settings.get('sliceTiming', {}).get('laserDuration', None),
+        'camera_delay_ms': spim_settings.get('sliceTiming', {}).get('cameraDelay', None),
+        'camera_exposure_ms': spim_settings.get('sliceTiming', {}).get('cameraExposure', None),
+        'slice_duration_ms': spim_settings.get('sliceTiming', {}).get('sliceDuration', None),
+        
+        # Desired/requested acquisition parameters
+        'desired_slice_period_ms': spim_settings.get('desiredSlicePeriod', None),
+        'desired_light_exposure_ms': spim_settings.get('desiredLightExposure', None),
+        'minimize_slice_period': spim_settings.get('minimizeSlicePeriod', False),
+        
+        # Duration information
+        'duration_slice_ms': spim_settings.get('durationSliceMs', None),
+        'duration_volume_ms': spim_settings.get('durationVolumeMs', None),
+        'duration_total_sec': spim_settings.get('durationTotalSec', None),
+        
         # Other useful info
         'acquisition_name': summary.get('AcquisitionName', ''),
         'date': summary.get('Date', ''),
         'pixel_type': summary.get('PixelType', ''),
         'bit_depth': int(summary.get('BitDepth', 16)),
         'mv_rotations': summary.get('MVRotations', ''),
+        'spim_type': summary.get('SPIMtype', ''),
+        'laser_exposure_ms': float(summary.get('LaserExposure_ms', 0)) if summary.get('LaserExposure_ms') else None,
         
         # Full metadata for reference
         'raw_summary': summary,
@@ -263,9 +290,9 @@ def discover_acquisitions(root_dir='.'):
                     continue
                 
                 folder_name = subfolder.name.lower()
-                if 'alpha' in folder_name and 'beads' in folder_name:
+                if 'alpha' in folder_name and 'worm' in folder_name:
                     alpha_folder = subfolder
-                elif 'beta' in folder_name and 'beads' in folder_name:
+                elif 'beta' in folder_name and 'worm' in folder_name:
                     beta_folder = subfolder
             
             # If we found both alpha and beta, create an acquisition entry
@@ -348,8 +375,16 @@ def calculate_temporal_alignment(alpha_meta, beta_meta):
         - 'alpha_start': Alpha start datetime
         - 'beta_start': Beta start datetime
         - 'slice_period_ms': Average slice period
+        - 'delay_before_side': Delay before beta side starts (seconds)
         - 'frame_times_alpha': Array of frame times for alpha (relative to alpha start)
         - 'frame_times_beta': Array of frame times for beta (relative to beta start)
+        - 'num_slices': Number of slices
+        - 'alpha_slice_duration_ms': Actual slice duration for alpha (if available)
+        - 'beta_slice_duration_ms': Actual slice duration for beta (if available)
+        - 'alpha_camera_offset_ms': Estimated timing offset between cameras in alpha arm (if sequential)
+        - 'beta_camera_offset_ms': Estimated timing offset between cameras in beta arm (if sequential)
+        - 'alpha_cameras_simultaneous': Whether alpha cameras acquire simultaneously
+        - 'beta_cameras_simultaneous': Whether beta cameras acquire simultaneously
     """
     alpha_start = parse_start_time(alpha_meta['start_time'])
     beta_start = parse_start_time(beta_meta['start_time'])
@@ -381,6 +416,25 @@ def calculate_temporal_alignment(alpha_meta, beta_meta):
     # Beta frame times: starts after delay_before_side
     frame_times_beta = np.arange(num_slices) * beta_slice_period + delay_before_side
     
+    # Get detailed timing information if available
+    alpha_slice_duration = alpha_meta.get('slice_duration_ms')
+    beta_slice_duration = beta_meta.get('slice_duration_ms')
+    
+    # Calculate camera timing offsets if cameras are sequential
+    alpha_camera_offset = None
+    beta_camera_offset = None
+    if not alpha_meta.get('acquire_both_cameras_simultaneously', False):
+        # If cameras are sequential, estimate offset from camera delay/exposure
+        alpha_timing = alpha_meta.get('slice_timing', {})
+        if alpha_timing.get('cameraDelay') is not None and alpha_timing.get('cameraExposure') is not None:
+            # Rough estimate: second camera starts after first camera finishes
+            alpha_camera_offset = alpha_timing.get('cameraDelay', 0) + alpha_timing.get('cameraExposure', 0)
+    
+    if not beta_meta.get('acquire_both_cameras_simultaneously', False):
+        beta_timing = beta_meta.get('slice_timing', {})
+        if beta_timing.get('cameraDelay') is not None and beta_timing.get('cameraExposure') is not None:
+            beta_camera_offset = beta_timing.get('cameraDelay', 0) + beta_timing.get('cameraExposure', 0)
+    
     return {
         'time_offset_sec': time_offset_sec,
         'alpha_start': alpha_start,
@@ -389,7 +443,14 @@ def calculate_temporal_alignment(alpha_meta, beta_meta):
         'delay_before_side': delay_before_side,
         'frame_times_alpha': frame_times_alpha,
         'frame_times_beta': frame_times_beta,
-        'num_slices': num_slices
+        'num_slices': num_slices,
+        # Additional timing information
+        'alpha_slice_duration_ms': alpha_slice_duration,
+        'beta_slice_duration_ms': beta_slice_duration,
+        'alpha_camera_offset_ms': alpha_camera_offset,
+        'beta_camera_offset_ms': beta_camera_offset,
+        'alpha_cameras_simultaneous': alpha_meta.get('acquire_both_cameras_simultaneously', False),
+        'beta_cameras_simultaneous': beta_meta.get('acquire_both_cameras_simultaneously', False)
     }
 
 
