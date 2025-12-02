@@ -601,7 +601,7 @@ def create_side_by_side_frame(alpha_slice, beta_slice, normalize=False, vmin_alp
 # Camera Overlay Visualization
 # ============================================================================
 
-def create_camera_overlay(cam1_img, cam2_img, cam1_name='', cam2_name=''):
+def create_camera_overlay(cam1_img, cam2_img, cam1_name='', cam2_name='', flip_cam2_horizontal=True):
     """
     Create a red/green overlay of two camera views (similar to MATLAB's imfuse).
     
@@ -609,27 +609,41 @@ def create_camera_overlay(cam1_img, cam2_img, cam1_name='', cam2_name=''):
     their spatial relationship. The first camera is shown in red, the second in green.
     Overlapping regions appear yellow.
     
+    IMPORTANT: Because the two objectives in a single arm face each other,
+    their cameras capture "mirror images" of the sample in the lateral direction.
+    By default, cam2 is horizontally flipped before overlay to account for this,
+    so the overlay shows how they would align after accounting for the mirror relationship.
+    
     Parameters:
     -----------
     cam1_img : numpy.ndarray
         First camera image (height, width) - will be displayed in red channel
     cam2_img : numpy.ndarray
         Second camera image (height, width) - will be displayed in green channel
+        Will be horizontally flipped if flip_cam2_horizontal=True
     cam1_name : str
         Name of first camera (for display)
     cam2_name : str
         Name of second camera (for display)
+    flip_cam2_horizontal : bool
+        If True, flip cam2_img horizontally (along X-axis) before overlay
+        to account for mirror image relationship between cameras.
+        Default is True to show how cameras would align.
         
     Returns:
     --------
     numpy.ndarray : RGB image (height, width, 3) with values in [0, 1] range
         Red channel = cam1_img (normalized)
-        Green channel = cam2_img (normalized)
+        Green channel = cam2_img (normalized, optionally flipped)
         Blue channel = zeros
     """
     # Ensure images are the same size
     if cam1_img.shape != cam2_img.shape:
         raise ValueError(f"Camera images must have the same shape. Got {cam1_img.shape} and {cam2_img.shape}")
+    
+    # Apply horizontal flip to cam2 if needed (cameras capture mirror images)
+    if flip_cam2_horizontal:
+        cam2_img = np.flip(cam2_img, axis=1)  # Flip along X-axis (axis 1 for 2D image)
     
     # Normalize each camera image independently to [0, 1]
     cam1_scaled, _, _ = scale_image_for_display(cam1_img)
@@ -645,13 +659,18 @@ def create_camera_overlay(cam1_img, cam2_img, cam1_name='', cam2_name=''):
 
 
 def display_camera_overlays(alpha_data, beta_data, alpha_meta, beta_meta, 
-                            slice_indices=None, num_samples=5, figsize=(10, 2.5)):
+                            slice_indices=None, num_samples=5, figsize=(10, 2.5),
+                            flip_cam2_horizontal=True):
     """
     Display camera overlays for multiple slices showing alpha and beta arms side-by-side.
     
     For each slice, shows:
     - Alpha arm: Camera 0 (red) + Camera 1 (green) overlay
     - Beta arm: Camera 0 (red) + Camera 1 (green) overlay
+    
+    IMPORTANT: By default, Camera 1 is horizontally flipped before overlay to account
+    for the mirror image relationship between cameras in the same arm. This shows how
+    the cameras would align after accounting for the mirror relationship.
     
     Parameters:
     -----------
@@ -669,6 +688,9 @@ def display_camera_overlays(alpha_data, beta_data, alpha_meta, beta_meta,
         Number of sample slices to display (if slice_indices is None)
     figsize : tuple
         Figure size (width, height) in inches
+    flip_cam2_horizontal : bool
+        If True, flip Camera 1 horizontally before overlay to account for mirror image
+        relationship. Default is True to show how cameras would align.
         
     Returns:
     --------
@@ -705,11 +727,13 @@ def display_camera_overlays(alpha_data, beta_data, alpha_meta, beta_meta,
         beta_cam0 = beta_data[slice_idx, 0, :, :]
         beta_cam1 = beta_data[slice_idx, 1, :, :]
         
-        # Create overlays
+        # Create overlays (with horizontal flip to account for mirror images)
         alpha_overlay = create_camera_overlay(alpha_cam0, alpha_cam1, 
-                                             alpha_channels[0], alpha_channels[1])
+                                             alpha_channels[0], alpha_channels[1],
+                                             flip_cam2_horizontal=flip_cam2_horizontal)
         beta_overlay = create_camera_overlay(beta_cam0, beta_cam1,
-                                            beta_channels[0], beta_channels[1])
+                                            beta_channels[0], beta_channels[1],
+                                            flip_cam2_horizontal=flip_cam2_horizontal)
         
         # Display alpha overlay (left column)
         axes[i, 0].imshow(alpha_overlay, aspect='equal')

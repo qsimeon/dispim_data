@@ -12,16 +12,31 @@ The pipeline transforms raw double-diSPIM data into a single, isotropic 3D volum
 """
 
 import numpy as np
+
+# NumPy 2.0 compatibility: Some libraries (xarray, dask, SimpleITK) may use deprecated np.unicode_
+# Add compatibility shim immediately after importing numpy, before other imports
+if not hasattr(np, 'unicode_'):
+    np.unicode_ = np.str_
+
 from scipy import ndimage
+from pathlib import Path
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
 try:
+    import tifffile
+    HAS_TIFFFILE = True
+except ImportError:
+    HAS_TIFFFILE = False
+    warnings.warn("tifffile not available. Save/load functions will not work.")
+
+try:
     import SimpleITK as sitk
     HAS_SITK = True
-except ImportError:
+except (ImportError, AttributeError) as e:
     HAS_SITK = False
-    warnings.warn("SimpleITK not available. Registration functions will not work.")
+    warnings.warn(f"SimpleITK not available. Registration functions will not work. Error: {e}")
 
 try:
     import dask.array as da
@@ -280,12 +295,23 @@ def rough_align_beta_to_alpha(beta_stack):
 def align_cameras_within_arm(cam0_stack, cam1_stack, 
                              transform_type='rigid',
                              initial_transform=None,
-                             verbose=True):
+                             verbose=True,
+                             flip_cam1_horizontal=True,
+                             max_slices_for_registration=None,
+                             use_gpu=False):
     """
     Register two camera stacks within the same arm using SimpleITK.
     
     This aligns the two cameras (e.g., HamCam2 and HamCam1 in Alpha arm)
     that view the same sample from different angles.
+    
+    IMPORTANT: Because the two objectives in a single arm face each other,
+    their cameras capture "mirror images" of the sample in the lateral direction.
+    By default, cam1_stack is horizontally flipped before registration to account for this.
+    
+    NOTE ON GPU: SimpleITK does not support GPU acceleration. If use_gpu=True,
+    this function will attempt to use GPU-accelerated alternatives (if available),
+    otherwise falls back to CPU-based SimpleITK.
     
     Parameters:
     -----------
@@ -293,12 +319,22 @@ def align_cameras_within_arm(cam0_stack, cam1_stack,
         First camera stack (fixed image) - shape (Z, Y, X)
     cam1_stack : numpy.ndarray
         Second camera stack (moving image) - shape (Z, Y, X)
+        Will be horizontally flipped if flip_cam1_horizontal=True
     transform_type : str
         Type of transformation: 'rigid' (translation + rotation) or 'affine'
     initial_transform : SimpleITK.Transform or None
         Optional initial transformation guess
     verbose : bool
-        Print registration progress
+        Print registration progress with detailed logging
+    flip_cam1_horizontal : bool
+        If True, flip cam1_stack horizontally (along X-axis) before registration
+        to account for mirror image relationship between cameras
+    max_slices_for_registration : int or None
+        If specified, use only the first N slices for registration (faster for testing).
+        The transform will be applied to the full stack. Use None for full stack.
+    use_gpu : bool
+        If True, attempt to use GPU acceleration (currently not supported by SimpleITK,
+        but included for future compatibility)
         
     Returns:
     --------
@@ -309,10 +345,63 @@ def align_cameras_within_arm(cam0_stack, cam1_stack,
     if not HAS_SITK:
         raise ImportError("SimpleITK is required for registration. Install with: pip install SimpleITK")
     
+    if use_gpu:
+        warnings.warn("GPU acceleration is not currently supported by SimpleITK. Using CPU-based registration.")
+    
+    import time
+    start_time = time.time()
+    
+    # Optionally use subset of slices for faster registration (for testing)
+    original_shape = cam0_stack.shape
+    if max_slices_for_registration is not None and max_slices_for_registration < cam0_stack.shape[0]:
+        cam0_reg = cam0_stack[:max_slices_for_registration, :, :]
+        cam1_reg = cam1_stack[:max_slices_for_registration, :, :]
+        if verbose:
+            print(f"  Using {max_slices_for_registration}/{cam0_stack.shape[0]} slices for registration (faster)")
+    else:
+        cam0_reg = cam0_stack
+        cam1_reg = cam1_stack
+    
+    # Apply horizontal flip to cam1 if needed (cameras capture mirror images)
+    if flip_cam1_horizontal:
+        # Flip along X-axis (axis 2 in ZYX ordering)
+        cam1_reg = np.flip(cam1_reg, axis=2)
+        if verbose:
+            print("  Applied horizontal flip to cam1 to account for mirror image relationship")
+    
     # Convert numpy arrays to SimpleITK images
     # SimpleITK expects (X, Y, Z) ordering, so we need to transpose
-    fixed_image = sitk.GetImageFromArray(cam0_stack.transpose(2, 1, 0))
-    moving_image = sitk.GetImageFromArray(cam1_stack.transpose(2, 1, 0))
+    # Also, SimpleITK registration doesn't support uint16 directly, so convert to float32
+    # Normalize to [0, 1] range for better numerical stability
+    if verbose:
+        print(f"  Preparing images for registration...")
+        print(f"    Input shapes: cam0={cam0_reg.shape}, cam1={cam1_reg.shape}")
+    
+    cam0_float = cam0_reg.astype(np.float32)
+    cam1_float = cam1_reg.astype(np.float32)
+    
+    # Normalize to [0, 1] range based on data type
+    if cam0_reg.dtype == np.uint16:
+        cam0_float = cam0_float / 65535.0
+    elif cam0_reg.dtype == np.uint8:
+        cam0_float = cam0_float / 255.0
+    else:
+        # For other types, normalize by max value
+        cam0_max = cam0_float.max()
+        if cam0_max > 0:
+            cam0_float = cam0_float / cam0_max
+    
+    if cam1_reg.dtype == np.uint16:
+        cam1_float = cam1_float / 65535.0
+    elif cam1_reg.dtype == np.uint8:
+        cam1_float = cam1_float / 255.0
+    else:
+        cam1_max = cam1_float.max()
+        if cam1_max > 0:
+            cam1_float = cam1_float / cam1_max
+    
+    fixed_image = sitk.GetImageFromArray(cam0_float.transpose(2, 1, 0))
+    moving_image = sitk.GetImageFromArray(cam1_float.transpose(2, 1, 0))
     
     # Set spacing (assuming isotropic in XY, different in Z)
     # We'll use unit spacing for now - can be refined with actual pixel sizes
@@ -361,15 +450,31 @@ def align_cameras_within_arm(cam0_stack, cam1_stack,
     # Set interpolator
     registration_method.SetInterpolator(sitk.sitkLinear)
     
+    # Add progress callback for verbose output
+    if verbose:
+        def command_iteration(method):
+            """Callback function to report registration progress."""
+            iteration = method.GetOptimizerIteration()
+            metric_value = method.GetMetricValue()
+            # Print every 10 iterations to avoid spam
+            if iteration % 10 == 0 or iteration < 5:
+                print(f"    Iteration {iteration:3d}: Metric = {metric_value:10.6f}")
+        
+        registration_method.AddCommand(sitk.sitkIterationEvent, 
+                                      lambda: command_iteration(registration_method))
+        print("  Starting registration...")
+        print(f"    This may take several minutes for large volumes...")
+    
     # Execute registration
-    if verbose:
-        print("Starting registration...")
-    
+    reg_start_time = time.time()
     final_transform = registration_method.Execute(fixed_image, moving_image)
+    reg_time = time.time() - reg_start_time
     
     if verbose:
-        print(f"Optimizer stop condition: {registration_method.GetOptimizerStopConditionDescription()}")
-        print(f"Final metric value: {registration_method.GetMetricValue():.6f}")
+        print(f"  Registration completed in {reg_time:.1f} seconds")
+        print(f"  Optimizer stop condition: {registration_method.GetOptimizerStopConditionDescription()}")
+        print(f"  Final metric value: {registration_method.GetMetricValue():.6f}")
+        print(f"  Total iterations: {registration_method.GetOptimizerIteration()}")
     
     # Apply transformation
     resampler = sitk.ResampleImageFilter()
@@ -378,16 +483,83 @@ def align_cameras_within_arm(cam0_stack, cam1_stack,
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0)
     
+    if verbose:
+        print("  Applying transformation to full stack...")
+    
     resampled_image = resampler.Execute(moving_image)
     
     # Convert back to numpy array and transpose back to (Z, Y, X)
-    aligned_stack = sitk.GetArrayFromImage(resampled_image).transpose(2, 1, 0)
+    aligned_reg = sitk.GetArrayFromImage(resampled_image).transpose(2, 1, 0)
+    
+    # If we used a subset for registration, apply transform to full stack
+    if max_slices_for_registration is not None and max_slices_for_registration < original_shape[0]:
+        if verbose:
+            print(f"  Applying transform to full stack ({original_shape[0]} slices)...")
+        
+        # Prepare full cam1 stack (with flip if needed)
+        if flip_cam1_horizontal:
+            cam1_stack_full = np.flip(cam1_stack, axis=2)
+        else:
+            cam1_stack_full = cam1_stack
+        
+        # Convert full stack
+        cam1_full_float = cam1_stack_full.astype(np.float32)
+        if cam1_stack.dtype == np.uint16:
+            cam1_full_float = cam1_full_float / 65535.0
+        elif cam1_stack.dtype == np.uint8:
+            cam1_full_float = cam1_full_float / 255.0
+        else:
+            cam1_full_max = cam1_full_float.max()
+            if cam1_full_max > 0:
+                cam1_full_float = cam1_full_float / cam1_full_max
+        
+        moving_image_full = sitk.GetImageFromArray(cam1_full_float.transpose(2, 1, 0))
+        moving_image_full.SetSpacing([1.0, 1.0, 1.0])
+        
+        # Create reference image for full stack
+        ref_shape_xyz = (original_shape[2], original_shape[1], original_shape[0])
+        reference_image_full = sitk.Image(ref_shape_xyz, sitk.sitkFloat32)
+        reference_image_full.SetSpacing([1.0, 1.0, 1.0])
+        
+        # Resample full stack
+        resampler_full = sitk.ResampleImageFilter()
+        resampler_full.SetReferenceImage(reference_image_full)
+        resampler_full.SetTransform(final_transform)
+        resampler_full.SetInterpolator(sitk.sitkLinear)
+        resampler_full.SetDefaultPixelValue(0)
+        
+        resampled_full = resampler_full.Execute(moving_image_full)
+        aligned_stack = sitk.GetArrayFromImage(resampled_full).transpose(2, 1, 0)
+        
+        # Convert back to original dtype
+        if cam1_stack.dtype == np.uint16:
+            aligned_stack = np.clip(aligned_stack * 65535.0, 0, 65535).astype(cam1_stack.dtype)
+        elif cam1_stack.dtype == np.uint8:
+            aligned_stack = np.clip(aligned_stack * 255.0, 0, 255).astype(cam1_stack.dtype)
+        else:
+            aligned_stack = aligned_stack.astype(cam1_stack.dtype)
+    else:
+        # Use the aligned result directly
+        aligned_stack = aligned_reg
+        # Convert back to original dtype
+        if cam1_stack.dtype == np.uint16:
+            aligned_stack = np.clip(aligned_stack * 65535.0, 0, 65535).astype(cam1_stack.dtype)
+        elif cam1_stack.dtype == np.uint8:
+            aligned_stack = np.clip(aligned_stack * 255.0, 0, 255).astype(cam1_stack.dtype)
+        else:
+            aligned_stack = aligned_stack.astype(cam1_stack.dtype)
+    
+    total_time = time.time() - start_time
+    if verbose:
+        print(f"  Total processing time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
     
     # Collect metrics
     metrics = {
         'final_metric_value': registration_method.GetMetricValue(),
         'optimizer_iterations': registration_method.GetOptimizerIteration(),
-        'optimizer_stop_condition': registration_method.GetOptimizerStopConditionDescription()
+        'optimizer_stop_condition': registration_method.GetOptimizerStopConditionDescription(),
+        'registration_time_sec': reg_time,
+        'total_time_sec': total_time
     }
     
     return aligned_stack, final_transform, metrics
@@ -396,11 +568,16 @@ def align_cameras_within_arm(cam0_stack, cam1_stack,
 def register_arms(alpha_fused, beta_fused,
                   transform_type='rigid',
                   initial_transform=None,
-                  verbose=True):
+                  verbose=True,
+                  use_gpu=False):
     """
     Register Beta arm fused volume to Alpha arm fused volume.
     
     This performs fine alignment after rough alignment has been applied.
+    
+    NOTE ON GPU: SimpleITK does not support GPU acceleration. If use_gpu=True,
+    this function will attempt to use GPU-accelerated alternatives (if available),
+    otherwise falls back to CPU-based SimpleITK.
     
     Parameters:
     -----------
@@ -413,7 +590,10 @@ def register_arms(alpha_fused, beta_fused,
     initial_transform : SimpleITK.Transform or None
         Optional initial transformation guess
     verbose : bool
-        Print registration progress
+        Print registration progress with detailed logging
+    use_gpu : bool
+        If True, attempt to use GPU acceleration (currently not supported by SimpleITK,
+        but included for future compatibility)
         
     Returns:
     --------
@@ -424,9 +604,43 @@ def register_arms(alpha_fused, beta_fused,
     if not HAS_SITK:
         raise ImportError("SimpleITK is required for registration. Install with: pip install SimpleITK")
     
+    if use_gpu:
+        warnings.warn("GPU acceleration is not currently supported by SimpleITK. Using CPU-based registration.")
+    
+    import time
+    start_time = time.time()
+    
+    if verbose:
+        print(f"  Preparing images for registration...")
+        print(f"    Input shapes: alpha={alpha_fused.shape}, beta={beta_fused.shape}")
+    
     # Convert to SimpleITK images (transpose to X, Y, Z)
-    fixed_image = sitk.GetImageFromArray(alpha_fused.transpose(2, 1, 0))
-    moving_image = sitk.GetImageFromArray(beta_fused.transpose(2, 1, 0))
+    # SimpleITK registration doesn't support uint16 directly, so convert to float32
+    # Normalize to [0, 1] range for better numerical stability
+    alpha_float = alpha_fused.astype(np.float32)
+    beta_float = beta_fused.astype(np.float32)
+    
+    # Normalize to [0, 1] range based on data type
+    if alpha_fused.dtype == np.uint16:
+        alpha_float = alpha_float / 65535.0
+    elif alpha_fused.dtype == np.uint8:
+        alpha_float = alpha_float / 255.0
+    else:
+        alpha_max = alpha_float.max()
+        if alpha_max > 0:
+            alpha_float = alpha_float / alpha_max
+    
+    if beta_fused.dtype == np.uint16:
+        beta_float = beta_float / 65535.0
+    elif beta_fused.dtype == np.uint8:
+        beta_float = beta_float / 255.0
+    else:
+        beta_max = beta_float.max()
+        if beta_max > 0:
+            beta_float = beta_float / beta_max
+    
+    fixed_image = sitk.GetImageFromArray(alpha_float.transpose(2, 1, 0))
+    moving_image = sitk.GetImageFromArray(beta_float.transpose(2, 1, 0))
     
     fixed_image.SetSpacing([1.0, 1.0, 1.0])
     moving_image.SetSpacing([1.0, 1.0, 1.0])
@@ -463,14 +677,31 @@ def register_arms(alpha_fused, beta_fused,
     
     registration_method.SetInterpolator(sitk.sitkLinear)
     
+    # Add progress callback for verbose output
     if verbose:
-        print("Starting inter-arm registration...")
+        def command_iteration(method):
+            """Callback function to report registration progress."""
+            iteration = method.GetOptimizerIteration()
+            metric_value = method.GetMetricValue()
+            # Print every 20 iterations to avoid spam (inter-arm registration has more iterations)
+            if iteration % 20 == 0 or iteration < 5:
+                print(f"    Iteration {iteration:3d}: Metric = {metric_value:10.6f}")
+        
+        registration_method.AddCommand(sitk.sitkIterationEvent, 
+                                      lambda: command_iteration(registration_method))
+        print("  Starting inter-arm registration...")
+        print(f"    This may take several minutes for large volumes...")
     
+    # Execute registration
+    reg_start_time = time.time()
     final_transform = registration_method.Execute(fixed_image, moving_image)
+    reg_time = time.time() - reg_start_time
     
     if verbose:
-        print(f"Optimizer stop condition: {registration_method.GetOptimizerStopConditionDescription()}")
-        print(f"Final metric value: {registration_method.GetMetricValue():.6f}")
+        print(f"  Registration completed in {reg_time:.1f} seconds ({reg_time/60:.1f} minutes)")
+        print(f"  Optimizer stop condition: {registration_method.GetOptimizerStopConditionDescription()}")
+        print(f"  Final metric value: {registration_method.GetMetricValue():.6f}")
+        print(f"  Total iterations: {registration_method.GetOptimizerIteration()}")
     
     # Apply transformation
     resampler = sitk.ResampleImageFilter()
@@ -479,15 +710,24 @@ def register_arms(alpha_fused, beta_fused,
     resampler.SetInterpolator(sitk.sitkLinear)
     resampler.SetDefaultPixelValue(0)
     
+    if verbose:
+        print("  Applying transformation...")
+    
     resampled_image = resampler.Execute(moving_image)
     
     # Convert back to numpy
     aligned_stack = sitk.GetArrayFromImage(resampled_image).transpose(2, 1, 0)
     
+    total_time = time.time() - start_time
+    if verbose:
+        print(f"  Total processing time: {total_time:.1f} seconds ({total_time/60:.1f} minutes)")
+    
     metrics = {
         'final_metric_value': registration_method.GetMetricValue(),
         'optimizer_iterations': registration_method.GetOptimizerIteration(),
-        'optimizer_stop_condition': registration_method.GetOptimizerStopConditionDescription()
+        'optimizer_stop_condition': registration_method.GetOptimizerStopConditionDescription(),
+        'registration_time_sec': reg_time,
+        'total_time_sec': total_time
     }
     
     return aligned_stack, final_transform, metrics
@@ -516,7 +756,22 @@ def apply_transform(stack, transform, reference_shape=None, reference_spacing=No
         raise ImportError("SimpleITK is required. Install with: pip install SimpleITK")
     
     # Convert to SimpleITK image
-    moving_image = sitk.GetImageFromArray(stack.transpose(2, 1, 0))
+    # Convert to float32 for SimpleITK compatibility
+    original_dtype = stack.dtype
+    stack_float = stack.astype(np.float32)
+    
+    # Normalize if needed (preserve relative intensities)
+    stack_max = None
+    if original_dtype == np.uint16:
+        stack_float = stack_float / 65535.0
+    elif original_dtype == np.uint8:
+        stack_float = stack_float / 255.0
+    else:
+        stack_max = stack_float.max()
+        if stack_max > 1.0:
+            stack_float = stack_float / stack_max
+    
+    moving_image = sitk.GetImageFromArray(stack_float.transpose(2, 1, 0))
     
     if reference_spacing is None:
         reference_spacing = [1.0, 1.0, 1.0]
@@ -542,6 +797,17 @@ def apply_transform(stack, transform, reference_shape=None, reference_spacing=No
     
     # Convert back to numpy (Z, Y, X)
     transformed_stack = sitk.GetArrayFromImage(resampled_image).transpose(2, 1, 0)
+    
+    # Convert back to original dtype
+    if original_dtype == np.uint16:
+        transformed_stack = np.clip(transformed_stack * 65535.0, 0, 65535).astype(original_dtype)
+    elif original_dtype == np.uint8:
+        transformed_stack = np.clip(transformed_stack * 255.0, 0, 255).astype(original_dtype)
+    else:
+        # For other types, scale back if we normalized
+        if stack_max is not None and stack_max > 1.0:
+            transformed_stack = transformed_stack * stack_max
+        transformed_stack = transformed_stack.astype(original_dtype)
     
     return transformed_stack
 
@@ -643,4 +909,345 @@ def compute_mip_xyz(stack):
         'xz': compute_mip(stack, axis=1),  # Project along Y -> XZ view
         'yz': compute_mip(stack, axis=2)    # Project along X -> YZ view
     }
+
+
+# ============================================================================
+# Save/Load Functions for Intermediate Results
+# ============================================================================
+
+def save_deskewed_stack(stack, output_path, transform_info=None, metadata=None):
+    """
+    Save a deskewed stack to disk with associated metadata.
+    
+    Parameters:
+    -----------
+    stack : numpy.ndarray
+        3D deskewed stack with shape (Z, Y, X)
+    output_path : str or Path
+        Path where to save the stack (will save as .tif)
+    transform_info : dict or None
+        Dictionary containing transformation information (from deskew_stack)
+    metadata : dict or None
+        Additional metadata to save as JSON alongside the stack
+        
+    Returns:
+    --------
+    Path : Path to saved file
+    Path : Path to metadata JSON file (if metadata provided)
+    """
+    if not HAS_TIFFFILE:
+        raise ImportError("tifffile is required for saving. Install with: pip install tifffile")
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save the stack as TIFF
+    tifffile.imwrite(
+        str(output_path),
+        stack,
+        photometric='minisblack',
+        metadata={'axes': 'ZYX'}
+    )
+    
+    # Save metadata as JSON if provided
+    metadata_path = None
+    if transform_info is not None or metadata is not None:
+        metadata_path = output_path.with_suffix('.json')
+        save_metadata = {}
+        if transform_info is not None:
+            # Convert numpy arrays to lists for JSON serialization
+            transform_info_json = {}
+            for key, value in transform_info.items():
+                if isinstance(value, np.ndarray):
+                    transform_info_json[key] = value.tolist()
+                elif isinstance(value, (np.integer, np.floating)):
+                    transform_info_json[key] = float(value)
+                else:
+                    transform_info_json[key] = value
+            save_metadata['transform_info'] = transform_info_json
+        
+        if metadata is not None:
+            save_metadata['metadata'] = metadata
+        
+        with open(metadata_path, 'w') as f:
+            json.dump(save_metadata, f, indent=2)
+    
+    return output_path, metadata_path
+
+
+def load_deskewed_stack(stack_path, load_metadata=True):
+    """
+    Load a deskewed stack from disk.
+    
+    Parameters:
+    -----------
+    stack_path : str or Path
+        Path to the saved stack (.tif file)
+    load_metadata : bool
+        If True, also load associated metadata JSON file
+        
+    Returns:
+    --------
+    numpy.ndarray : The loaded stack
+    dict or None : Metadata dictionary if load_metadata=True and file exists
+    """
+    if not HAS_TIFFFILE:
+        raise ImportError("tifffile is required for loading. Install with: pip install tifffile")
+    
+    stack_path = Path(stack_path)
+    
+    # Load the stack
+    stack = tifffile.imread(str(stack_path))
+    
+    # Load metadata if requested
+    metadata = None
+    if load_metadata:
+        metadata_path = stack_path.with_suffix('.json')
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+    
+    return stack, metadata
+
+
+def get_deskewed_paths(base_output_dir, acquisition_name, camera_name, arm_name):
+    """
+    Generate standardized file paths for deskewed stacks.
+    
+    Parameters:
+    -----------
+    base_output_dir : str or Path
+        Base directory for saving processed results
+    acquisition_name : str
+        Name of the acquisition (e.g., "Worm1_starved_adult_SWF1188_I")
+    camera_name : str
+        Name of the camera (e.g., "HamCam2", "HamCam1")
+    arm_name : str
+        Name of the arm ("alpha" or "beta")
+        
+    Returns:
+    --------
+    Path : Path to the deskewed stack file
+    Path : Path to the metadata JSON file
+    """
+    base_output_dir = Path(base_output_dir)
+    output_dir = base_output_dir / acquisition_name / 'deskewed'
+    
+    # Create filename: arm_camera_deskewed.tif
+    filename = f"{arm_name}_{camera_name}_deskewed.tif"
+    stack_path = output_dir / filename
+    metadata_path = stack_path.with_suffix('.json')
+    
+    return stack_path, metadata_path
+
+
+def check_deskewed_exists(base_output_dir, acquisition_name, camera_name, arm_name):
+    """
+    Check if a deskewed stack already exists on disk.
+    
+    Parameters:
+    -----------
+    base_output_dir : str or Path
+        Base directory for processed results
+    acquisition_name : str
+        Name of the acquisition
+    camera_name : str
+        Name of the camera
+    arm_name : str
+        Name of the arm ("alpha" or "beta")
+        
+    Returns:
+    --------
+    bool : True if deskewed stack exists
+    Path : Path to the stack file (or None if doesn't exist)
+    Path : Path to metadata file (or None if doesn't exist)
+    """
+    stack_path, metadata_path = get_deskewed_paths(
+        base_output_dir, acquisition_name, camera_name, arm_name
+    )
+    
+    exists = stack_path.exists()
+    return exists, stack_path if exists else None, metadata_path if exists and metadata_path.exists() else None
+
+
+# ============================================================================
+# Generic Save/Load Functions for All Intermediate Results
+# ============================================================================
+
+def save_processed_stack(stack, output_path, metadata=None):
+    """
+    Generic function to save any processed 3D stack.
+    
+    Parameters:
+    -----------
+    stack : numpy.ndarray
+        3D stack with shape (Z, Y, X)
+    output_path : str or Path
+        Path where to save the stack (.tif)
+    metadata : dict or None
+        Additional metadata to save as JSON
+        
+    Returns:
+    --------
+    Path : Path to saved file
+    Path or None : Path to metadata JSON file (if metadata provided)
+    """
+    if not HAS_TIFFFILE:
+        raise ImportError("tifffile is required for saving. Install with: pip install tifffile")
+    
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save the stack as TIFF
+    tifffile.imwrite(
+        str(output_path),
+        stack,
+        photometric='minisblack',
+        metadata={'axes': 'ZYX'}
+    )
+    
+    # Save metadata as JSON if provided
+    metadata_path = None
+    if metadata is not None:
+        metadata_path = output_path.with_suffix('.json')
+        # Convert numpy types to Python types for JSON serialization
+        metadata_json = {}
+        for key, value in metadata.items():
+            if isinstance(value, np.ndarray):
+                metadata_json[key] = value.tolist()
+            elif isinstance(value, (np.integer, np.floating)):
+                metadata_json[key] = float(value) if isinstance(value, np.floating) else int(value)
+            elif isinstance(value, (list, tuple)):
+                metadata_json[key] = [
+                    float(v) if isinstance(v, np.floating) else int(v) if isinstance(v, np.integer) else v
+                    for v in value
+                ]
+            else:
+                metadata_json[key] = value
+        
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata_json, f, indent=2)
+    
+    return output_path, metadata_path
+
+
+def load_processed_stack(stack_path, load_metadata=True):
+    """
+    Generic function to load any processed 3D stack.
+    
+    Parameters:
+    -----------
+    stack_path : str or Path
+        Path to the saved stack (.tif file)
+    load_metadata : bool
+        If True, also load associated metadata JSON file
+        
+    Returns:
+    --------
+    numpy.ndarray : The loaded stack
+    dict or None : Metadata dictionary if load_metadata=True and file exists
+    """
+    if not HAS_TIFFFILE:
+        raise ImportError("tifffile is required for loading. Install with: pip install tifffile")
+    
+    stack_path = Path(stack_path)
+    
+    # Load the stack
+    stack = tifffile.imread(str(stack_path))
+    
+    # Load metadata if requested
+    metadata = None
+    if load_metadata:
+        metadata_path = stack_path.with_suffix('.json')
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+    
+    return stack, metadata
+
+
+def get_processed_paths(base_output_dir, acquisition_name, stage_name, filename_base):
+    """
+    Generate standardized file paths for processed stacks.
+    
+    Parameters:
+    -----------
+    base_output_dir : str or Path
+        Base directory for saving processed results
+    acquisition_name : str
+        Name of the acquisition
+    stage_name : str
+        Processing stage name (e.g., 'aligned', 'registered', 'fused')
+    filename_base : str
+        Base filename (e.g., 'alpha_cam1_aligned')
+        
+    Returns:
+    --------
+    Path : Path to the stack file
+    Path : Path to the metadata JSON file
+    """
+    base_output_dir = Path(base_output_dir)
+    output_dir = base_output_dir / acquisition_name / stage_name
+    
+    # Create filename
+    filename = f"{filename_base}.tif"
+    stack_path = output_dir / filename
+    metadata_path = stack_path.with_suffix('.json')
+    
+    return stack_path, metadata_path
+
+
+def check_processed_exists(base_output_dir, acquisition_name, stage_name, filename_base):
+    """
+    Check if a processed stack already exists on disk.
+    
+    Parameters:
+    -----------
+    base_output_dir : str or Path
+        Base directory for processed results
+    acquisition_name : str
+        Name of the acquisition
+    stage_name : str
+        Processing stage name
+    filename_base : str
+        Base filename
+        
+    Returns:
+    --------
+    bool : True if processed stack exists
+    Path : Path to the stack file (or None if doesn't exist)
+    Path : Path to metadata file (or None if doesn't exist)
+    """
+    stack_path, metadata_path = get_processed_paths(
+        base_output_dir, acquisition_name, stage_name, filename_base
+    )
+    
+    exists = stack_path.exists()
+    return exists, stack_path if exists else None, metadata_path if exists and metadata_path.exists() else None
+
+
+# Convenience functions for specific processing stages
+
+def get_aligned_camera_paths(base_output_dir, acquisition_name, camera_name, arm_name):
+    """Get paths for intra-arm aligned camera stacks."""
+    filename_base = f"{arm_name}_{camera_name}_aligned"
+    return get_processed_paths(base_output_dir, acquisition_name, 'aligned', filename_base)
+
+
+def get_rough_aligned_paths(base_output_dir, acquisition_name, camera_name):
+    """Get paths for rough-aligned beta camera stacks."""
+    filename_base = f"beta_{camera_name}_rough_aligned"
+    return get_processed_paths(base_output_dir, acquisition_name, 'rough_aligned', filename_base)
+
+
+def get_registered_paths(base_output_dir, acquisition_name, camera_name):
+    """Get paths for fine-registered beta camera stacks."""
+    filename_base = f"beta_{camera_name}_registered"
+    return get_processed_paths(base_output_dir, acquisition_name, 'registered', filename_base)
+
+
+def get_fused_paths(base_output_dir, acquisition_name):
+    """Get paths for fused volume."""
+    filename_base = "fused_volume"
+    return get_processed_paths(base_output_dir, acquisition_name, 'fused', filename_base)
 
