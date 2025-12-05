@@ -15,6 +15,7 @@ dependencies:
   - dask-image
   - scikit-image
   - napari
+  - flask
   - pip
   - pip:
     - tifffile
