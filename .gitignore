@@ -1,5 +1,11 @@
 # Data directories (too large for git)
+datasets/
 *_worm/
+
+# Large image files
+*.ome.tif
+*.tif
+*.tiff
 
 # Video files
 *.mp4
@@ -37,3 +43,5 @@ Thumbs.db
 *.tmp
 *.log
 
+processed_output/
+documents/
